@@ -1,43 +1,68 @@
-# model_router.py
-"""
-Smart Model Router
-Automatically routes requests to the most cost-effective model
-"""
+"""Smart model router with Langfuse instrumentation."""
 
+from __future__ import annotations
+
+import re
+import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
-import re
+
+from anthropic import Anthropic
 from dotenv import load_dotenv
+from langfuse import get_client, observe
+from openai import OpenAI
 
 load_dotenv()
 
 
 class TaskType(Enum):
-    SIMPLE = "simple"  # Yes/no, classification
-    MODERATE = "moderate"  # Summarization, extraction
-    COMPLEX = "complex"  # Analysis, reasoning
-    CODE = "code"  # Code generation
-    CREATIVE = "creative"  # Creative writing
+    SIMPLE = "simple"  # Yes/no answers and basic classification.
+    MODERATE = "moderate"  # Summarization and information extraction.
+    COMPLEX = "complex"  # Analysis, comparison, and reasoning.
+    CODE = "code"  # Code generation or debugging.
+    CREATIVE = "creative"  # Creative writing tasks.
+
+
+@dataclass
+class ModelCallResult:
+    """Normalized response data across Anthropic and OpenAI calls."""
+
+    content: str
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    estimated_cost: float
+    duration_ms: float
+
+
+PRICING = {
+    # Prices are USD per 1M tokens; keep this table aligned with vendor pricing pages.
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+}
 
 
 class ModelRouter:
-    """Route requests to optimal models based on task analysis."""
+    """Route requests to the lowest-cost model that should handle the task."""
 
-    # Model tiers (cheapest first)
     MODELS = {
-        TaskType.SIMPLE: "claude-3-5-haiku-20241022",  # $0.25/1M
-        TaskType.MODERATE: "gpt-4o-mini",  # $0.15/1M
-        TaskType.CODE: "claude-sonnet-4-20250514",  # Best for code
-        TaskType.COMPLEX: "claude-sonnet-4-20250514",  # $3/1M
-        TaskType.CREATIVE: "gpt-4o",  # $2.50/1M
+        TaskType.SIMPLE: "claude-haiku-4-5-20251001",
+        TaskType.MODERATE: "gpt-4o-mini",
+        TaskType.CODE: "claude-sonnet-4-6",
+        TaskType.COMPLEX: "claude-sonnet-4-6",
+        TaskType.CREATIVE: "gpt-4o",
     }
 
     def classify_task(self, prompt: str) -> TaskType:
-        """Analyze prompt to determine task type."""
+        """Classify a prompt with simple, explainable keyword patterns."""
 
         prompt_lower = prompt.lower()
 
-        # Simple patterns - yes/no, classification
         simple_patterns = [
             r"\b(yes or no)\b",
             r"\b(true or false)\b",
@@ -45,45 +70,37 @@ class ModelRouter:
             r"^is (this|it|the)",
             r"\b(which one|choose|select)\b",
         ]
-        for pattern in simple_patterns:
-            if re.search(pattern, prompt_lower):
-                return TaskType.SIMPLE
+        if any(re.search(pattern, prompt_lower) for pattern in simple_patterns):
+            return TaskType.SIMPLE
 
-        # Code patterns
         code_patterns = [
             r"\b(write|create|generate|fix|debug).*(code|function|class|script)\b",
             r"\b(python|javascript|typescript|java|rust)\b",
-            r"```",  # Code blocks in prompt
+            r"```",
         ]
-        for pattern in code_patterns:
-            if re.search(pattern, prompt_lower):
-                return TaskType.CODE
+        if any(re.search(pattern, prompt_lower) for pattern in code_patterns):
+            return TaskType.CODE
 
-        # Complex reasoning patterns
         complex_patterns = [
             r"\b(analyze|evaluate|compare|critique)\b",
             r"\b(why|how).*(work|happen|cause)\b",
             r"\b(pros and cons|trade-?offs)\b",
             r"\b(explain.*(detail|depth))\b",
         ]
-        for pattern in complex_patterns:
-            if re.search(pattern, prompt_lower):
-                return TaskType.COMPLEX
+        if any(re.search(pattern, prompt_lower) for pattern in complex_patterns):
+            return TaskType.COMPLEX
 
-        # Creative patterns
         creative_patterns = [
             r"\b(write|create|compose).*(story|poem|essay|blog)\b",
             r"\b(creative|imaginative|original)\b",
         ]
-        for pattern in creative_patterns:
-            if re.search(pattern, prompt_lower):
-                return TaskType.CREATIVE
+        if any(re.search(pattern, prompt_lower) for pattern in creative_patterns):
+            return TaskType.CREATIVE
 
-        # Default to moderate
         return TaskType.MODERATE
 
     def route(self, prompt: str, override_model: Optional[str] = None) -> str:
-        """Get the optimal model for a prompt."""
+        """Return an explicit override or the model mapped to the detected task."""
 
         if override_model:
             return override_model
@@ -92,59 +109,146 @@ class ModelRouter:
         return self.MODELS[task_type]
 
 
-# Integration with observability
-from langfuse import observe, Langfuse
-from anthropic import Anthropic
-from openai import OpenAI
-
-langfuse = Langfuse()
+langfuse = get_client()
 router = ModelRouter()
-
-# Initialize clients
 anthropic_client = Anthropic()
 openai_client = OpenAI()
 
 
-def call_claude(prompt: str, model: str):
-    """Call Claude API."""
+def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimate provider cost from the local pricing table."""
+
+    pricing = PRICING.get(model, {"input": 0.0, "output": 0.0})
+    return (
+        input_tokens * pricing["input"] / 1_000_000
+        + output_tokens * pricing["output"] / 1_000_000
+    )
+
+
+@observe(name="call_claude_routed", as_type="generation")
+def call_claude(prompt: str, model: str, max_tokens: int = 1024) -> ModelCallResult:
+    """Call Anthropic and record the provider request as a Langfuse generation."""
+
+    start = time.perf_counter()
     response = anthropic_client.messages.create(
-        model=model, max_tokens=1024, messages=[{"role": "user", "content": prompt}]
+        model=model,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
     )
-    return response.content[0]
+
+    content = response.content[0].text
+    input_tokens = response.usage.input_tokens
+    output_tokens = response.usage.output_tokens
+    total_tokens = input_tokens + output_tokens
+    cost = estimate_cost(model, input_tokens, output_tokens)
+    duration_ms = (time.perf_counter() - start) * 1000
+
+    langfuse.update_current_generation(
+        model=model,
+        input=[{"role": "user", "content": prompt}],
+        output=content,
+        usage_details={
+            "input": input_tokens,
+            "output": output_tokens,
+            "total": total_tokens,
+        },
+        cost_details={"total": cost},
+        metadata={"provider": "anthropic", "duration_ms": duration_ms},
+    )
+
+    return ModelCallResult(
+        content=content,
+        provider="anthropic",
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        estimated_cost=cost,
+        duration_ms=duration_ms,
+    )
 
 
-def call_openai(prompt: str, model: str):
-    """Call OpenAI API."""
+@observe(name="call_openai_routed", as_type="generation")
+def call_openai(prompt: str, model: str) -> ModelCallResult:
+    """Call OpenAI and record the provider request as a Langfuse generation."""
+
+    start = time.perf_counter()
     response = openai_client.chat.completions.create(
-        model=model, messages=[{"role": "user", "content": prompt}]
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
     )
-    return response.choices[0].message
+
+    content = response.choices[0].message.content or ""
+    input_tokens = response.usage.prompt_tokens if response.usage else 0
+    output_tokens = response.usage.completion_tokens if response.usage else 0
+    total_tokens = response.usage.total_tokens if response.usage else 0
+    cost = estimate_cost(model, input_tokens, output_tokens)
+    duration_ms = (time.perf_counter() - start) * 1000
+
+    langfuse.update_current_generation(
+        model=model,
+        input=[{"role": "user", "content": prompt}],
+        output=content,
+        usage_details={
+            "input": input_tokens,
+            "output": output_tokens,
+            "total": total_tokens,
+        },
+        cost_details={"total": cost},
+        metadata={"provider": "openai", "duration_ms": duration_ms},
+    )
+
+    return ModelCallResult(
+        content=content,
+        provider="openai",
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        estimated_cost=cost,
+        duration_ms=duration_ms,
+    )
 
 
-@observe()
-def routed_llm_call(prompt: str, override_model: str = None) -> str:
-    """LLM call with automatic model routing."""
+@observe(name="routed_llm_call", as_type="span")
+def routed_llm_call(prompt: str, override_model: Optional[str] = None) -> str:
+    """Classify the prompt, route it, call the provider, and trace the decision."""
 
-    selected_model = router.route(prompt, override_model)
     task_type = router.classify_task(prompt)
+    selected_model = router.route(prompt, override_model)
+
+    if selected_model.startswith("claude"):
+        result = call_claude(prompt, model=selected_model)
+    else:
+        result = call_openai(prompt, model=selected_model)
 
     langfuse.update_current_span(
+        input={"prompt": prompt, "override_model": override_model},
+        output={"content": result.content},
         metadata={
             "task_type": task_type.value,
             "routed_model": selected_model,
-        }
+            "override_used": override_model is not None,
+            "provider": result.provider,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "total_tokens": result.total_tokens,
+            "estimated_cost": result.estimated_cost,
+            "duration_ms": result.duration_ms,
+        },
     )
 
-    # Use the provider-appropriate function
-    if "claude" in selected_model:
-        return call_claude(prompt, model=selected_model).text
-    else:
-        return call_openai(prompt, model=selected_model).content
+    return result.content
 
 
 if __name__ == "__main__":
-    # Test different prompts to see routing in action
-    print(routed_llm_call("Is 2 + 2 = 4? Yes or no"))  # Routes to SIMPLE
-    print(routed_llm_call("Write a Python function to sort a list"))  # Routes to CODE
+    examples = [
+        "Is 2 + 2 = 4? Yes or no",
+        "Write a Python function to sort a list",
+    ]
+
+    for prompt in examples:
+        print(f"\nPrompt: {prompt}")
+        print(routed_llm_call(prompt))
 
     langfuse.flush()
