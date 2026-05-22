@@ -15,19 +15,26 @@ langfuse = Langfuse()
 
 expression = "123 + 456 * 2"
 
-# Create a trace and use context managers for spans/generations
-with langfuse.start_as_current_span(name="calculator_context_manager") as trace:
+# Create a trace and use context managers for spans/generations.
+with langfuse.start_as_current_observation(
+    name="calculator_context_manager",
+    as_type="span",
+) as trace:
 
     # Add a span for preprocessing
-    with langfuse.start_as_current_span(name="input_validation") as validation_span:
+    with langfuse.start_as_current_observation(
+        name="input_validation",
+        as_type="span",
+    ) as validation_span:
         langfuse.update_current_span(
             input={"expression": expression},
             output={"status": "valid"},
         )
 
     # Add a generation for the LLM call
-    with langfuse.start_as_current_generation(
+    with langfuse.start_as_current_observation(
         name="llm_calculation",
+        as_type="generation",
         model="gpt-4o-mini",
         input=[
             {
@@ -58,8 +65,8 @@ with langfuse.start_as_current_span(name="calculator_context_manager") as trace:
             metadata={"project": "context_manager_example"},
         )
 
-    # Update trace with final output
-    langfuse.update_current_trace(
+    # Update the root span with final output and tags.
+    trace.update(
         output={"result": result},
         tags=["calculator", "context_manager"],
     )

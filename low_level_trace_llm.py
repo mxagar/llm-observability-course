@@ -19,9 +19,10 @@ langfuse = Langfuse()
 
 expression = "123 + 456 * 2"
 
-# Create root span - this creates a new trace automatically
-root_span = langfuse.start_span(
+# Create root span - this creates a new trace automatically.
+root_span = langfuse.start_observation(
     name="calculator_low_level",
+    as_type="span",
     input={"expression": expression},
     metadata={"project": "low_level_example"},
 )
@@ -29,9 +30,10 @@ root_span = langfuse.start_span(
 # Get the trace_id for later use (scores)
 trace_id = root_span.trace_id
 
-# Create a child span for preprocessing
-preprocessing_span = langfuse.start_span(
+# Create a child span for preprocessing.
+preprocessing_span = root_span.start_observation(
     name="preprocessing",
+    as_type="span",
     input={"raw_expression": expression},
 )
 preprocessing_span.update(
@@ -56,9 +58,10 @@ completion = client.chat.completions.create(
 end_time = time.time()
 result = completion.choices[0].message.content
 
-# Log generation with full control
-generation = langfuse.start_generation(
+# Log generation with full control as another child observation.
+generation = root_span.start_observation(
     name="llm_calculation",
+    as_type="generation",
     model="gpt-4o-mini",
     model_parameters={"temperature": 1.0},
     input=[
@@ -101,6 +104,7 @@ langfuse.create_score(
 # Create an event for debugging/logging (within current context)
 event = langfuse.create_event(
     name="calculation_complete",
+    trace_context={"trace_id": trace_id},
     input={"expression": expression},
     output={"result": result},
     metadata={"duration_ms": (end_time - start_time) * 1000},

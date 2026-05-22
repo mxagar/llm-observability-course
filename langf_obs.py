@@ -14,7 +14,7 @@ def verify_connection():
     client.flush()
 
     print("Connection to Langfuse is successful!")
-    print("check your dashboard at https://app.langfuse.com/dashboard")
+    print("check your dashboard at http://localhost:3000")
 
 
 @observe
@@ -27,3 +27,4 @@ def test_generation():
 
 if __name__ == "__main__":
     verify_connection()
+    test_generation()
